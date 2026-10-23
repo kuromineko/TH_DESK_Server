@@ -1,7 +1,6 @@
 <div align="center">
 
-![Uploading fff44b85-48dd-44df-af25-d9f0b7237f5a.png…]()
-
+<img width="2170" height="725" alt="fff44b85-48dd-44df-af25-d9f0b7237f5a" src="https://github.com/user-attachments/assets/9612e217-5e96-403c-a6ae-0080fb8a24fb" />
 
 # 🖥️ TH_DESK Server Manager (x64)
 **โปรแกรมจัดการเซิร์ฟเวอร์รีโมทเดสก์ท็อปสำเร็จรูป รองรับ DDNS, แยกพอร์ต IN/OUT และเปิด Firewall อัตโนมัติ**  
