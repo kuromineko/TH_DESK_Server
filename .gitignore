@@ -1,0 +1,6 @@
+[Bb]in/
+[Oo]bj/
+.vs/
+*.user
+th_desk_server.cfg
+Client_Config_Export/
