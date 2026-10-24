@@ -1,4 +1,6 @@
 ﻿using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
@@ -6,11 +8,14 @@ using System.Net;
 using System.Net.Sockets;
 using System.Reflection;
 using System.Text;
+using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Threading;
 
 using WinForms = System.Windows.Forms;
 using Drawing = System.Drawing;
@@ -23,14 +28,41 @@ using Brushes = System.Windows.Media.Brushes;
 
 namespace TH_DESK_Server
 {
+    public class PeerSessionInfo
+    {
+        public string PeerId { get; set; } = "-";
+        public string IpAddress { get; set; } = "-";
+        public string Mode { get; set; } = "UDP Direct";
+        public DateTime FirstSeen { get; set; } = DateTime.Now;
+        public DateTime LastSeen { get; set; } = DateTime.Now;
+        public long BytesTransferred { get; set; } = 0;
+
+        public bool IsOnline => (DateTime.Now - LastSeen).TotalSeconds < 65;
+        public string StatusText => IsOnline ? "🟢 Online" : "⚪ Offline";
+        public string LastSeenText => $"{LastSeen:HH:mm:ss} ({(int)(DateTime.Now - LastSeen).TotalSeconds}s ago)";
+    }
+
     public partial class MainWindow : Window
     {
         private Process? _hbbsProc;
         private Process? _hbbrProc;
         private TcpListener? _tcpBridgeListener;
+        private TcpListener? _webConsoleListener;
         private CancellationTokenSource? _bridgeCts;
+        private DispatcherTimer? _telemetryTimer;
+
         private bool _isRunning = false;
         private string _currentLang = "TH";
+        private DateTime _serverStartTime;
+        private int _activeTcpTunnels = 0;
+        private long _totalBytesRouted = 0;
+        private int _lastInternalHbbsPort = 14997;
+        private int _lastRelayInPort = 4998;
+        private string _lastDdns = "";
+        private int _lastRelayOutPort = 4998;
+
+        private readonly ConcurrentDictionary<string, PeerSessionInfo> _peers = new();
+        private readonly ConcurrentQueue<string> _eventLogs = new();
         private readonly string _configPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "th_desk_server.cfg");
         private WinForms.NotifyIcon? _trayIcon;
         private const string AutoStartTaskName = "TH_DESK_Server_AutoStart";
@@ -42,6 +74,9 @@ namespace TH_DESK_Server
             LoadSavedConfig();
             CheckAutoStartStatus();
             ApplyLanguage(_currentLang);
+            InitTelemetryTimer();
+
+            AddServerLog("เริ่มต้นโปรแกรม TH_DESK Server Pro Console พร้อมใช้งาน");
 
             string[] args = Environment.GetCommandLineArgs();
             if (args.Any(a => a.Equals("--autostart", StringComparison.OrdinalIgnoreCase)))
@@ -54,12 +89,99 @@ namespace TH_DESK_Server
             }
         }
 
+        // ==================== 0. ระบบ Telemetry & Watchdog Timer ====================
+        private void InitTelemetryTimer()
+        {
+            _telemetryTimer = new DispatcherTimer
+            {
+                Interval = TimeSpan.FromSeconds(1)
+            };
+            _telemetryTimer.Tick += (s, e) =>
+            {
+                int onlineCount = _peers.Values.Count(p => p.IsOnline);
+                txtStatOnlinePeers.Text = onlineCount.ToString();
+                txtStatActiveTunnels.Text = Math.Max(0, _activeTcpTunnels).ToString();
+                txtStatTraffic.Text = FormatBytes(Interlocked.Read(ref _totalBytesRouted));
+
+                if (_isRunning)
+                {
+                    TimeSpan up = DateTime.Now - _serverStartTime;
+                    txtStatUptime.Text = $"{(int)up.TotalHours:D2}:{up.Minutes:D2}:{up.Seconds:D2}";
+
+                    if (chkAutoRestartWatchdog.IsChecked == true && DateTime.Now.Second % 4 == 0)
+                    {
+                        EnsureProcessesAlive();
+                    }
+                }
+                else
+                {
+                    txtStatUptime.Text = "00:00:00";
+                }
+
+                if (pageMonitor.Visibility == Visibility.Visible)
+                {
+                    gridPeers.ItemsSource = _peers.Values
+                        .OrderByDescending(p => p.IsOnline)
+                        .ThenByDescending(p => p.LastSeen)
+                        .ToList();
+                }
+            };
+            _telemetryTimer.Start();
+        }
+
+        private void EnsureProcessesAlive()
+        {
+            try
+            {
+                string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+                if (_hbbrProc == null || _hbbrProc.HasExited)
+                {
+                    string hbbrPath = Path.Combine(baseDir, "hbbr.exe");
+                    if (File.Exists(hbbrPath))
+                    {
+                        _hbbrProc = StartHiddenProcess(hbbrPath, $"-p {_lastRelayInPort}");
+                        AddServerLog($"[Watchdog] ตรวจพบ hbbr.exe หยุดทำงาน -> สั่งรันใหม่อัตโนมัติที่พอร์ต {_lastRelayInPort}");
+                    }
+                }
+                if (_hbbsProc == null || _hbbsProc.HasExited)
+                {
+                    string hbbsPath = Path.Combine(baseDir, "hbbs.exe");
+                    if (File.Exists(hbbsPath))
+                    {
+                        _hbbsProc = StartHiddenProcess(hbbsPath, $"-p {_lastInternalHbbsPort} -r {_lastDdns}:{_lastRelayOutPort}");
+                        AddServerLog($"[Watchdog] ตรวจพบ hbbs.exe หยุดทำงาน -> สั่งรันใหม่อัตโนมัติที่พอร์ต {_lastInternalHbbsPort}");
+                    }
+                }
+            }
+            catch { }
+        }
+
+        private void AddServerLog(string message)
+        {
+            string line = $"[{DateTime.Now:HH:mm:ss}] {message}";
+            _eventLogs.Enqueue(line);
+            while (_eventLogs.Count > 120) _eventLogs.TryDequeue(out _);
+
+            Dispatcher.BeginInvoke(() =>
+            {
+                txtServerLogs.Text = string.Join("\r\n", _eventLogs.Reverse());
+            });
+        }
+
+        private static string FormatBytes(long bytes)
+        {
+            if (bytes < 1024) return $"{bytes} B";
+            if (bytes < 1024 * 1024) return $"{bytes / 1024.0:F1} KB";
+            if (bytes < 1024L * 1024 * 1024) return $"{bytes / (1024.0 * 1024.0):F2} MB";
+            return $"{bytes / (1024.0 * 1024.0 * 1024.0):F2} GB";
+        }
+
         // ==================== 1. ระบบพับเก็บลงมุมขวาล่าง (System Tray) ====================
         private void InitSystemTray()
         {
             _trayIcon = new WinForms.NotifyIcon
             {
-                Text = "TH_DESK Server (x64)",
+                Text = "TH_DESK Server Pro (x64)",
                 Icon = CreateAppTrayIcon(),
                 Visible = true
             };
@@ -74,9 +196,10 @@ namespace TH_DESK_Server
             bool isTH = (_currentLang == "TH");
 
             var menu = new WinForms.ContextMenuStrip();
-            menu.Items.Add(isTH ? "เปิดหน้าต่าง TH_DESK Server" : "Open TH_DESK Server", null, (s, e) => RestoreFromTray());
+            menu.Items.Add(isTH ? "🖥 เปิดหน้าต่าง TH_DESK Server" : "🖥 Open TH_DESK Server", null, (s, e) => RestoreFromTray());
+            menu.Items.Add(isTH ? "🌐 เปิดหน้า Web Console บนเบราว์เซอร์" : "🌐 Open Web Console", null, (s, e) => BtnOpenWeb_Click(this, new RoutedEventArgs()));
             menu.Items.Add(new WinForms.ToolStripSeparator());
-            menu.Items.Add(isTH ? "ปิดระบบและออกจากโปรแกรม" : "Stop Server & Exit", null, (s, e) => ExitApplication());
+            menu.Items.Add(isTH ? "✕ ปิดระบบและออกจากโปรแกรม" : "✕ Stop Server & Exit", null, (s, e) => ExitApplication());
             _trayIcon.ContextMenuStrip = menu;
         }
 
@@ -94,7 +217,6 @@ namespace TH_DESK_Server
                             exeIcon.Handle,
                             Int32Rect.Empty,
                             System.Windows.Media.Imaging.BitmapSizeOptions.FromEmptyOptions());
-
                         return exeIcon;
                     }
                 }
@@ -186,10 +308,40 @@ namespace TH_DESK_Server
             }
         }
 
-        // ==================== 3. ระบบส่งออกไฟล์ตั้งค่าให้เครื่องลูกข่าย ====================
+        // ==================== 3. ระบบส่งออกไฟล์ตั้งค่าให้เครื่องลูกข่าย (ไม่บังคับ Relay เพื่อให้วิ่ง P2P UDP ก่อน) ====================
+        private string GenerateClientBatScript(string ddns, int idOut, int relayOut, string pubKey)
+        {
+            return
+                "@echo off\r\n" +
+                "chcp 65001 >nul\r\n" +
+                "echo ======================================================\r\n" +
+                "echo   กำลังติดตั้งค่าเซิร์ฟเวอร์ TH_DESK อัตโนมัติ (ไม่ต้องกรอก IP/Key)\r\n" +
+                "echo ======================================================\r\n" +
+                "taskkill /F /IM TH_DESK.exe >nul 2>&1\r\n" +
+                "taskkill /F /IM rustdesk.exe >nul 2>&1\r\n" +
+                "if not exist \"%APPDATA%\\TH_DESK\\config\" mkdir \"%APPDATA%\\TH_DESK\\config\"\r\n" +
+                "if not exist \"%APPDATA%\\RustDesk\\config\" mkdir \"%APPDATA%\\RustDesk\\config\"\r\n" +
+                "(\r\n" +
+                $"echo rendezvous_server = '{ddns}:{idOut}'\r\n" +
+                "echo nat_type = 1\r\n" +
+                "echo serial = 0\r\n" +
+                "echo.\r\n" +
+                "echo [options]\r\n" +
+                $"echo custom-rendezvous-server = '{ddns}:{idOut}'\r\n" +
+                $"echo relay-server = '{ddns}:{relayOut}'\r\n" +
+                $"echo key = '{pubKey}'\r\n" +
+                "echo direct-server = 'Y'\r\n" +
+                ") > \"%APPDATA%\\TH_DESK\\config\\TH_DESK2.toml\"\r\n" +
+                "copy /Y \"%APPDATA%\\TH_DESK\\config\\TH_DESK2.toml\" \"%APPDATA%\\RustDesk\\config\\RustDesk2.toml\" >nul\r\n" +
+                "echo.\r\n" +
+                $"echo [สำเร็จ] ตั้งค่าเชื่อมต่อมายัง {ddns}:{idOut} เรียบร้อยแล้ว!\r\n" +
+                "echo สามารถเปิดโปรแกรม TH_DESK ใช้งานได้ทันที\r\n" +
+                "pause\r\n";
+        }
+
         private void BtnExportClient_Click(object sender, RoutedEventArgs e)
         {
-            if (!ValidatePorts(out _, out int idOut, out _, out int relayOut))
+            if (!ValidatePorts(out _, out int idOut, out _, out int relayOut, out _))
                 return;
 
             string ddns = txtDdns.Text.Trim();
@@ -210,53 +362,19 @@ namespace TH_DESK_Server
 
             string tomlContent =
                 $"rendezvous_server = '{ddns}:{idOut}'\r\n" +
-                $"nat_type = 2\r\n" +
+                $"nat_type = 1\r\n" +
                 $"serial = 0\r\n\r\n" +
                 $"[options]\r\n" +
                 $"custom-rendezvous-server = '{ddns}:{idOut}'\r\n" +
                 $"relay-server = '{ddns}:{relayOut}'\r\n" +
                 $"key = '{pubKey}'\r\n" +
-                $"direct-server = 'Y'\r\n" +
-                $"force-always-relay = 'Y'\r\n";
+                $"direct-server = 'Y'\r\n";
 
             File.WriteAllText(Path.Combine(exportDir, "TH_DESK2.toml"), tomlContent, new UTF8Encoding(false));
-
-            string batContent =
-                "@echo off\r\n" +
-                "chcp 65001 >nul\r\n" +
-                "echo ======================================================\r\n" +
-                "echo   กำลังติดตั้งค่าเซิร์ฟเวอร์ TH_DESK อัตโนมัติ (ไม่ต้องกรอก IP/Key)\r\n" +
-                "echo ======================================================\r\n" +
-                "taskkill /F /IM TH_DESK.exe >nul 2>&1\r\n" +
-                "taskkill /F /IM rustdesk.exe >nul 2>&1\r\n" +
-                "if not exist \"%APPDATA%\\TH_DESK\\config\" mkdir \"%APPDATA%\\TH_DESK\\config\"\r\n" +
-                "if not exist \"%APPDATA%\\RustDesk\\config\" mkdir \"%APPDATA%\\RustDesk\\config\"\r\n" +
-                "(\r\n" +
-                $"echo rendezvous_server = '{ddns}:{idOut}'\r\n" +
-                "echo nat_type = 2\r\n" +
-                "echo serial = 0\r\n" +
-                "echo.\r\n" +
-                "echo [options]\r\n" +
-                $"echo custom-rendezvous-server = '{ddns}:{idOut}'\r\n" +
-                $"echo relay-server = '{ddns}:{relayOut}'\r\n" +
-                $"echo key = '{pubKey}'\r\n" +
-                "echo direct-server = 'Y'\r\n" +
-                "echo force-always-relay = 'Y'\r\n" +
-                ") > \"%APPDATA%\\TH_DESK\\config\\TH_DESK2.toml\"\r\n" +
-                "copy /Y \"%APPDATA%\\TH_DESK\\config\\TH_DESK2.toml\" \"%APPDATA%\\RustDesk\\config\\RustDesk2.toml\" >nul\r\n" +
-                "echo.\r\n" +
-                $"echo [สำเร็จ] ตั้งค่าเชื่อมต่อมายัง {ddns}:{idOut} เรียบร้อยแล้ว!\r\n" +
-                "echo สามารถเปิดโปรแกรม TH_DESK ใช้งานได้ทันที\r\n" +
-                "pause\r\n";
-
-            File.WriteAllText(Path.Combine(exportDir, "Setup_TH_DESK_Client.bat"), batContent, new UTF8Encoding(false));
+            File.WriteAllText(Path.Combine(exportDir, "Setup_TH_DESK_Client.bat"), GenerateClientBatScript(ddns, idOut, relayOut, pubKey), new UTF8Encoding(false));
 
             Process.Start("explorer.exe", exportDir);
-
-            lblStatus.Text = _currentLang == "TH"
-                ? "ส่งออกไฟล์ตั้งค่าลูกข่ายไว้ที่โฟลเดอร์ Client_Config_Export เรียบร้อยแล้ว!"
-                : "Exported client configuration files to Client_Config_Export folder!";
-            lblStatus.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#38BDF8"));
+            AddServerLog("ส่งออกไฟล์ตั้งค่าลูกข่าย Setup_TH_DESK_Client.bat เรียบร้อยแล้ว");
         }
 
         // ==================== 4. ดึงไฟล์ hbbs.exe / hbbr.exe ที่ฝังใน EXE ====================
@@ -269,9 +387,7 @@ namespace TH_DESK_Server
 
         private void ExtractSingleFile(string fileName, string outputPath)
         {
-            if (File.Exists(outputPath))
-                return;
-
+            if (File.Exists(outputPath)) return;
             try
             {
                 var assembly = Assembly.GetExecutingAssembly();
@@ -304,6 +420,7 @@ namespace TH_DESK_Server
         private void SetActivePage(string page)
         {
             pageDashboard.Visibility = page == "DASH" ? Visibility.Visible : Visibility.Collapsed;
+            pageMonitor.Visibility = page == "MON" ? Visibility.Visible : Visibility.Collapsed;
             pageSettings.Visibility = page == "SET" ? Visibility.Visible : Visibility.Collapsed;
             pageAbout.Visibility = page == "ABOUT" ? Visibility.Visible : Visibility.Collapsed;
 
@@ -315,6 +432,9 @@ namespace TH_DESK_Server
             navDashboard.Background = page == "DASH" ? activeBg : normalBg;
             navDashboard.Foreground = page == "DASH" ? activeFg : normalFg;
 
+            navMonitor.Background = page == "MON" ? activeBg : normalBg;
+            navMonitor.Foreground = page == "MON" ? activeFg : normalFg;
+
             navSettings.Background = page == "SET" ? activeBg : normalBg;
             navSettings.Foreground = page == "SET" ? activeFg : normalFg;
 
@@ -323,8 +443,18 @@ namespace TH_DESK_Server
         }
 
         private void NavDashboard_Click(object sender, RoutedEventArgs e) => SetActivePage("DASH");
+        private void NavMonitor_Click(object sender, RoutedEventArgs e) => SetActivePage("MON");
         private void NavSettings_Click(object sender, RoutedEventArgs e) => SetActivePage("SET");
         private void NavAbout_Click(object sender, RoutedEventArgs e) => SetActivePage("ABOUT");
+
+        private void BtnClearPeers_Click(object sender, RoutedEventArgs e)
+        {
+            foreach (var kv in _peers.Where(x => !x.Value.IsOnline).ToList())
+            {
+                _peers.TryRemove(kv.Key, out _);
+            }
+            gridPeers.ItemsSource = _peers.Values.ToList();
+        }
 
         // ==================== 6. ระบบสลับ 2 ภาษา (TH / EN) ====================
         private void BtnLangToggle_Click(object sender, RoutedEventArgs e)
@@ -359,24 +489,21 @@ namespace TH_DESK_Server
             UpdateTrayMenuText();
 
             navDashboard.Content = isTH ? "🖥  หน้าหลัก Server" : "🖥  Dashboard";
+            navMonitor.Content = isTH ? "📡  เครื่องที่เชื่อมต่อ (Live)" : "📡  Live Peers & Logs";
             navSettings.Content = isTH ? "⚙  ตั้งค่าระบบ" : "⚙  Settings";
             navAbout.Content = isTH ? "ℹ  เกี่ยวกับโปรแกรม" : "ℹ  About & Credits";
 
+            lblStatPeersTitle.Text = isTH ? "🟢 เครื่องที่ออนไลน์" : "🟢 Online Peers";
+            lblStatTunnelsTitle.Text = isTH ? "⚡ ท่อที่กำลังเชื่อม" : "⚡ Active Tunnels";
+            lblStatTrafficTitle.Text = isTH ? "📊 ข้อมูลสะสม (Traffic)" : "📊 Server Traffic";
+            lblStatUptimeTitle.Text = isTH ? "⏱ เวลาทำงาน (Uptime)" : "⏱ Server Uptime";
+
             lblDdnsTitle.Text = isTH ? "1. โดเมน DDNS หรือ Public IP ของคุณ" : "1. Your DDNS Domain or Public IP";
-            lblDdnsSub.Text = isTH ? "ที่อยู่สำหรับให้เครื่องปลายทางเชื่อมต่อเข้ามาจากภายนอก" : "External host address for client connections";
-            lblIdServerTitle.Text = "2. ID Server (hbbs + TCP Bridge)";
-            lblIdInPort.Text = isTH ? "IN Port (ในเครื่อง):" : "IN Port (Local PC):";
-            lblIdOutPort.Text = isTH ? "Out Port (พอร์ตนอก):" : "Out Port (External):";
-            lblRelayServerTitle.Text = "3. Relay Server (hbbr)";
-            lblRelayInPort.Text = isTH ? "IN Port (ในเครื่อง):" : "IN Port (Local PC):";
-            lblRelayOutPort.Text = isTH ? "Out Port (พอร์ตนอก):" : "Out Port (External):";
+            lblDdnsSub.Text = isTH ? "ที่อยู่สำหรับให้เครื่องปลายทางเชื่อมต่อและเปิดหน้า Web Console" : "External host address for client connections & Web Console";
 
             if (!_isRunning)
             {
-                btnToggle.Content = isTH ? "▶  เปิดระบบ Server + เปิด Firewall" : "▶  Start Server & Open Firewall";
-                lblStatus.Text = isTH
-                    ? "พร้อมทำงาน — รองรับโหมด TCP Bridge ทะลุ THDDNS / CGNAT อัตโนมัติ"
-                    : "Ready — Supports TCP Bridge mode for THDDNS / CGNAT";
+                btnToggle.Content = isTH ? "▶  เปิดระบบ Server + Web Console + เปิด Firewall" : "▶  Start Server + Web Console & Firewall";
             }
             else
             {
@@ -384,39 +511,11 @@ namespace TH_DESK_Server
             }
 
             btnCheckPort.Content = isTH ? "⚡ เช็คพอร์ต" : "⚡ Test Ports";
-            lblPubKeyTitle.Text = isTH ? "Public Key (สร้างอัตโนมัติจาก id_ed25519.pub)" : "Public Key (Auto-generated from id_ed25519.pub)";
-            lblClientConfigTitle.Text = isTH ? "ข้อมูลสำหรับนำไปใส่ในโปรแกรม TH_DESK (ฝั่งผู้ใช้งาน)" : "Connection Parameters for TH_DESK Client";
             btnCopy.Content = isTH ? "📋 คัดลอกค่า" : "📋 Copy Text";
             btnExportClient.Content = isTH ? "📥 ส่งออกไฟล์ลูกข่าย" : "📥 Export Client File";
-
-            lblSettingsHeader.Text = isTH ? "ตั้งค่าระบบ (System Settings)" : "System Settings";
-            lblSettingsSub.Text = isTH ? "กำหนดภาษา พฤติกรรมการเปิดพอร์ต และการจัดการไฟล์ระบบของ TH_DESK Server" : "Configure interface language, startup behavior, and server key management";
-            lblLangSettingTitle.Text = isTH ? "ภาษาที่แสดงผล (Display Language)" : "Display Language";
-            lblLangSettingDesc.Text = isTH ? "สลับภาษาเมนูและข้อความแจ้งเตือนระหว่าง ภาษาไทย และ English" : "Switch user interface language between Thai and English";
-            chkAutoStartBoot.Content = isTH ? "เปิดโปรแกรมและรันระบบ Server อัตโนมัติเมื่อเปิดเครื่อง Windows (Auto-Start on Boot)" : "Automatically start Server on Windows Boot (Task Scheduler)";
-            chkMinimizeToTray.Content = isTH ? "พับเก็บลงมุมขวาล่างข้างนาฬิกา (System Tray) เมื่อกดปุ่มย่อหน้าต่าง" : "Minimize to System Tray instead of Taskbar";
-            chkAutoFirewall.Content = isTH ? "เปิดพอร์ตใน Windows Firewall อัตโนมัติทุกครั้งที่กดเริ่มระบบ Server" : "Automatically open Windows Firewall ports when starting the server";
-            chkSaveConfig.Content = isTH ? "บันทึกค่า DDNS และหมายเลข Port อัตโนมัติเมื่อกดเปิดระบบ" : "Automatically save DDNS and port configuration on start";
-            chkKillOnExit.Content = isTH ? "ปิดโปรเซส hbbs.exe และ hbbr.exe อัตโนมัติเมื่อกดปิดโปรแกรมนี้" : "Stop hbbs.exe and hbbr.exe background processes when closing this window";
-            lblFolderSettingTitle.Text = isTH ? "การจัดการไฟล์ Server และรหัสความปลอดภัย (Key Management)" : "Server Directory & KeyPair Management";
-            btnOpenFolder.Content = isTH ? "📂 เปิดโฟลเดอร์เก็บไฟล์ Server" : "📂 Open Server Folder";
-            btnResetKey.Content = isTH ? "🔑 ลบและสร้าง Public Key ใหม่" : "🔑 Regenerate KeyPair";
-
-            lblAboutHeader.Text = isTH ? "เกี่ยวกับ TH_DESK (About & Open Source Credits)" : "About TH_DESK & Open Source Credits";
-            lblAboutDesc.Text = isTH ? "โปรแกรมรีโมทเดสก์ท็อปและตัวจัดการเซิร์ฟเวอร์แบบโอเพนซอร์ส แจกจ่ายฟรีสำหรับทุกคน" : "Free & Open-Source P2P Remote Desktop and Self-Hosted Server Manager";
-            lblCreatorTitle.Text = isTH ? "ผู้พัฒนาและดูแลโปรเจกต์ (Developer & Maintainer)" : "Developer & Project Maintainer";
-            lblCreatorName.Text = isTH ? "• พัฒนาและดูแลโปรเจกต์โดย: kuromineko" : "• Developed & Maintained by: kuromineko";
-            lblCreatorRepo.Text = "• GitHub Repository: https://github.com/kuromineko/TH_DESK";
-            btnOpenMyGithub.Content = isTH ? "🔗 เปิดหน้า GitHub ของ TH_DESK (kuromineko/TH_DESK)" : "🔗 Visit TH_DESK GitHub (kuromineko/TH_DESK)";
-            lblSourceTitle.Text = isTH ? "ที่มาของซอร์สโค้ดต้นฉบับและสัญญาอนุญาต (Upstream & License)" : "Original Upstream Project & License Notice";
-            lblLicenseNotice.Text = isTH
-                ? "โปรแกรม TH_DESK พัฒนาต่อยอดจากโปรเจกต์โอเพนซอร์ส RustDesk และทำงานร่วมกับคอร์เซิร์ฟเวอร์ RustDesk Server OSS (hbbs / hbbr) เผยแพร่ภายใต้สัญญาอนุญาตสาธารณะ GNU Affero General Public License v3.0 (AGPL-3.0) โดยเปิดเผยซอร์สโค้ดและแจกจ่ายให้ใช้งานได้ฟรี"
-                : "TH_DESK is derived from the open-source RustDesk project and utilizes RustDesk Server OSS (hbbs / hbbr) binaries. Distributed free of charge under the GNU Affero General Public License v3.0 (AGPL-3.0) with full source code availability.";
-            btnOpenRustDeskGithub.Content = isTH ? "🌐 โค้ดต้นฉบับ RustDesk Official" : "🌐 Upstream RustDesk GitHub";
-            btnOpenLicense.Content = isTH ? "📜 อ่านสัญญาอนุญาต AGPL-3.0" : "📜 View AGPL-3.0 License";
         }
 
-        // ==================== 7. ระบบควบคุม Server & TCP-to-UDP Bridge ====================
+        // ==================== 7. ระบบควบคุม Server, UDP/TCP Proxy & Web Dashboard ====================
         private async void BtnToggle_Click(object sender, RoutedEventArgs e)
         {
             bool isTH = (_currentLang == "TH");
@@ -425,13 +524,14 @@ namespace TH_DESK_Server
             {
                 StopServerProcesses();
                 _isRunning = false;
-                btnToggle.Content = isTH ? "▶  เปิดระบบ Server + เปิด Firewall" : "▶  Start Server & Open Firewall";
+                btnToggle.Content = isTH ? "▶  เปิดระบบ Server + Web Console + เปิด Firewall" : "▶  Start Server + Web Console & Firewall";
                 btnToggle.Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#10B981"));
                 dotStatus.Fill = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#64748B"));
                 txtHeaderStatus.Text = "Offline";
                 txtHeaderStatus.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#94A3B8"));
                 lblStatus.Text = isTH ? "หยุดการทำงานของระบบ Server เรียบร้อยแล้ว" : "Server processes stopped.";
                 lblStatus.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#94A3B8"));
+                AddServerLog("หยุดการทำงานระบบ Server และปิดพอร์ตเชื่อมต่อแล้ว");
                 return;
             }
 
@@ -442,7 +542,7 @@ namespace TH_DESK_Server
         {
             bool isTH = (_currentLang == "TH");
 
-            if (!ValidatePorts(out int idIn, out int idOut, out int relayIn, out int relayOut))
+            if (!ValidatePorts(out int idIn, out int idOut, out int relayIn, out int relayOut, out int webPort))
                 return;
 
             if (chkSaveConfig.IsChecked == true)
@@ -457,19 +557,22 @@ namespace TH_DESK_Server
             if (!File.Exists(hbbsPath) || !File.Exists(hbbrPath))
             {
                 MessageBox.Show(
-                    isTH ? "ไม่สามารถดึงไฟล์ hbbs.exe หรือ hbbr.exe ออกมาได้!\nกรุณาตรวจสอบว่าตั้งค่า Build Action เป็น 'Embedded Resource' แล้ว"
-                         : "Could not extract hbbs.exe or hbbr.exe! Please ensure their Build Action is set to 'Embedded Resource'.",
+                    isTH ? "ไม่พบไฟล์ hbbs.exe หรือ hbbr.exe!" : "Could not find hbbs.exe or hbbr.exe!",
                     "TH_DESK Server", MessageBoxButton.OK, MessageBoxImage.Warning);
                 return;
             }
 
             string ddns = txtDdns.Text.Trim();
             bool openFw = (chkAutoFirewall.IsChecked == true);
+            bool enableWeb = (chkEnableWebConsole.IsChecked == true);
 
-            // คำนวณพอร์ตภายในสำหรับ hbbs.exe เพื่อไม่ให้ชนกับพอร์ต TCP Bridge หน้าบ้าน
             int internalHbbsPort = (idIn < 50000) ? (idIn + 10000) : (idIn - 10000);
+            _lastInternalHbbsPort = internalHbbsPort;
+            _lastRelayInPort = relayIn;
+            _lastDdns = ddns;
+            _lastRelayOutPort = relayOut;
 
-            lblStatus.Text = isTH ? "กำลังเริ่มระบบ Server พร้อมสะพานแปลงสัญญาณ TCP-to-UDP Bridge..." : "Starting Server with TCP-to-UDP Bridge...";
+            lblStatus.Text = isTH ? "กำลังเริ่มระบบ Server + Live Monitor + Web Console..." : "Starting Server + Live Monitor + Web Console...";
             lblStatus.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#38BDF8"));
 
             await Task.Run(() =>
@@ -482,24 +585,21 @@ namespace TH_DESK_Server
                     AllowProgramInFirewall("TH_DESK_HBBS_APP", hbbsPath);
                     AllowProgramInFirewall("TH_DESK_HBBR_APP", hbbrPath);
 
-                    for (int p = idIn - 1; p <= idIn + 2; p++)
+                    for (int p = idIn - 2; p <= idIn + 3; p++)
                     {
-                        if (p >= 1 && p <= 65535)
+                        if (p > 0)
                         {
                             OpenFirewall($"TH_DESK_ID_TCP_{p}", p, "TCP");
                             OpenFirewall($"TH_DESK_ID_UDP_{p}", p, "UDP");
                         }
                     }
                     OpenFirewall($"TH_DESK_RELAY_TCP_{relayIn}", relayIn, "TCP");
+                    if (enableWeb) OpenFirewall($"TH_DESK_WEB_{webPort}", webPort, "TCP");
                 }
 
-                // 1. รัน hbbr.exe (Relay Server) ที่พอร์ต relayIn ตามปกติ (เพราะเป็น TCP อยู่แล้ว)
                 _hbbrProc = StartHiddenProcess(hbbrPath, $"-p {relayIn}");
-
-                // 2. รัน hbbs.exe ที่พอร์ตหลังบ้าน (internalHbbsPort)
                 _hbbsProc = StartHiddenProcess(hbbsPath, $"-p {internalHbbsPort} -r {ddns}:{relayOut}");
 
-                // 3. เปิดสะพาน TCP-to-UDP Bridge ที่พอร์ตหน้าบ้าน (idIn)
                 StartTcpBridge(idIn, internalHbbsPort);
             });
 
@@ -512,7 +612,7 @@ namespace TH_DESK_Server
                     pubKey = File.ReadAllText(pubKeyFile).Trim();
                     break;
                 }
-                await Task.Delay(400);
+                await Task.Delay(350);
             }
 
             txtPubKey.Text = string.IsNullOrEmpty(pubKey) ? "Generating..." : pubKey;
@@ -521,6 +621,14 @@ namespace TH_DESK_Server
                 $"Relay Server: {ddns}:{relayOut}  (ใน LAN ใช้ :{relayIn})\r\n" +
                 $"Public Key  : {pubKey}";
 
+            if (enableWeb)
+            {
+                StartWebConsoleServer(webPort, ddns, idIn, idOut, relayIn, relayOut, pubKey);
+                btnOpenWebTop.Content = $"🌐 Web Console :{webPort}";
+                lblWebUrlSidebar.Text = $"http://localhost:{webPort}";
+            }
+
+            _serverStartTime = DateTime.Now;
             _isRunning = true;
             btnToggle.Content = isTH ? "■  หยุดการทำงาน Server (Stop)" : "■  Stop Server Processes";
             btnToggle.Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#EF4444"));
@@ -528,22 +636,23 @@ namespace TH_DESK_Server
             txtHeaderStatus.Text = "Online";
             txtHeaderStatus.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#10B981"));
             lblStatus.Text = isTH
-                ? $"ทำงานอยู่ (TCP Bridge Mode) — รับพอร์ต {idIn}/{relayIn} ➔ ออกสู่ {ddns}:{idOut}/{relayOut}"
-                : $"Online (TCP Bridge Mode) — Local {idIn}/{relayIn} ➔ External {ddns}:{idOut}/{relayOut}";
+                ? $"ออนไลน์ (ID :{idIn} [UDP+TCP] | Relay :{relayIn} | Web Console :http://localhost:{webPort})"
+                : $"Online (ID :{idIn} [UDP+TCP] | Relay :{relayIn} | Web Console :http://localhost:{webPort})";
             lblStatus.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#10B981"));
+
+            AddServerLog($"เปิดระบบสำเร็จ! ID Server :{idIn} (UDP+TCP), Relay :{relayIn}, Web Console :{webPort}");
         }
 
-        // ==================== สะพานแปลงสัญญาณ TCP <-> UDP (หัวใจหลักทะลุ THDDNS) ====================
+        // ==================== 8. ระบบรับส่ง UDP Direct + TCP Bridge พร้อมดักจับรายชื่อเครื่องลูกข่ายอัตโนมัติ ====================
         private void StartTcpBridge(int publicPort, int internalHbbsPort)
         {
             _bridgeCts = new CancellationTokenSource();
             var token = _bridgeCts.Token;
 
-            // เปิดรับทั้ง TCP (สำหรับทะลุ THDDNS) และ UDP (สำหรับเครื่องที่ต่อ UDP ปกติ)
             _tcpBridgeListener = new TcpListener(IPAddress.Any, publicPort);
             _tcpBridgeListener.Start();
 
-            // Task 1: รับสาย TCP จากภายนอก แล้วแยกแยะว่าเป็นคำสั่ง UDP-over-TCP (0xFE) หรือ TCP ปกติ
+            // รับสาย TCP (รองรับทั้งโหมดมาตรฐานและโหมด 0xFE Bridge)
             Task.Run(async () =>
             {
                 while (!token.IsCancellationRequested)
@@ -557,17 +666,19 @@ namespace TH_DESK_Server
                 }
             }, token);
 
-            // Task 2: ส่งต่อ UDP หน้าบ้าน (เผื่อใช้งานในวง LAN หรือลูกข่ายเดิม) ไปยัง internalHbbsPort
+            // รับสาย UDP มาตรฐาน (ดักจับ Peer ID ขึ้นตาราง Live Monitor + ส่งต่อเข้า hbbs)
             Task.Run(async () =>
             {
                 using var udpListener = new UdpClient(publicPort);
-                var clientMap = new System.Collections.Concurrent.ConcurrentDictionary<IPEndPoint, UdpClient>();
+                var clientMap = new ConcurrentDictionary<IPEndPoint, UdpClient>();
                 while (!token.IsCancellationRequested)
                 {
                     try
                     {
                         var received = await udpListener.ReceiveAsync(token);
                         var senderEp = received.RemoteEndPoint;
+                        Interlocked.Add(ref _totalBytesRouted, received.Buffer.Length);
+                        InspectPacketForPeerId(received.Buffer, senderEp.Address.ToString(), "UDP Direct (Standard)");
 
                         var relayUdp = clientMap.GetOrAdd(senderEp, ep =>
                         {
@@ -580,6 +691,7 @@ namespace TH_DESK_Server
                                     while (!token.IsCancellationRequested)
                                     {
                                         var resp = await u.ReceiveAsync(token);
+                                        Interlocked.Add(ref _totalBytesRouted, resp.Buffer.Length);
                                         await udpListener.SendAsync(resp.Buffer, resp.Buffer.Length, ep);
                                     }
                                 }
@@ -597,68 +709,117 @@ namespace TH_DESK_Server
 
         private async Task HandleBridgeClientAsync(TcpClient client, int internalHbbsPort, CancellationToken token)
         {
-            using (client)
+            Interlocked.Increment(ref _activeTcpTunnels);
+            string remoteIp = (client.Client.RemoteEndPoint as IPEndPoint)?.Address.ToString() ?? "Unknown";
+
+            try
             {
-                client.NoDelay = true;
-                using var stream = client.GetStream();
-
-                byte[] firstByte = new byte[1];
-                int r = await stream.ReadAsync(firstByte, 0, 1, token);
-                if (r == 0) return;
-
-                // ถ้ารหัสไบต์แรกเป็น 0xFE แปลว่าเป็นโหมด "UDP-over-TCP Tunnel" จากลูกข่าย TH_DESK!
-                if (firstByte[0] == 0xFE)
+                using (client)
                 {
-                    using var udp = new UdpClient();
-                    udp.Connect("127.0.0.1", internalHbbsPort);
+                    client.NoDelay = true;
+                    using var stream = client.GetStream();
 
-                    // ขาอ่านจาก UDP (hbbs) -> ส่งกลับเข้าท่อ TCP (ลูกข่าย)
-                    var udpToTcp = Task.Run(async () =>
+                    byte[] firstByte = new byte[1];
+                    int r = await stream.ReadAsync(firstByte, 0, 1, token);
+                    if (r == 0) return;
+
+                    if (firstByte[0] == 0xFE)
                     {
-                        try
+                        using var udp = new UdpClient();
+                        udp.Connect("127.0.0.1", internalHbbsPort);
+
+                        var udpToTcp = Task.Run(async () =>
                         {
-                            while (!token.IsCancellationRequested)
+                            try
                             {
-                                var res = await udp.ReceiveAsync(token);
-                                byte[] lenBuf = BitConverter.GetBytes((ushort)res.Buffer.Length);
-                                await stream.WriteAsync(lenBuf, 0, 2, token);
-                                await stream.WriteAsync(res.Buffer, 0, res.Buffer.Length, token);
-                                await stream.FlushAsync(token);
+                                while (!token.IsCancellationRequested)
+                                {
+                                    var res = await udp.ReceiveAsync(token);
+                                    Interlocked.Add(ref _totalBytesRouted, res.Buffer.Length);
+                                    byte[] lenBuf = BitConverter.GetBytes((ushort)res.Buffer.Length);
+                                    await stream.WriteAsync(lenBuf, 0, 2, token);
+                                    await stream.WriteAsync(res.Buffer, 0, res.Buffer.Length, token);
+                                    await stream.FlushAsync(token);
+                                }
                             }
+                            catch { }
+                        }, token);
+
+                        byte[] lenBytes = new byte[2];
+                        while (!token.IsCancellationRequested)
+                        {
+                            if (!await ReadExactAsync(stream, lenBytes, 2, token)) break;
+                            int packetLen = BitConverter.ToUInt16(lenBytes, 0);
+                            if (packetLen <= 0 || packetLen > 65500) break;
+
+                            byte[] payload = new byte[packetLen];
+                            if (!await ReadExactAsync(stream, payload, packetLen, token)) break;
+
+                            Interlocked.Add(ref _totalBytesRouted, packetLen);
+                            InspectPacketForPeerId(payload, remoteIp, "TCP Bridge (0xFE)");
+
+                            await udp.SendAsync(payload, packetLen);
                         }
-                        catch { }
-                    }, token);
-
-                    // ขาอ่านจากท่อ TCP (ลูกข่าย) -> ยิงเข้า UDP (hbbs)
-                    byte[] lenBytes = new byte[2];
-                    while (!token.IsCancellationRequested)
+                    }
+                    else
                     {
-                        if (!await ReadExactAsync(stream, lenBytes, 2, token)) break;
-                        int packetLen = BitConverter.ToUInt16(lenBytes, 0);
-                        if (packetLen <= 0 || packetLen > 65500) break;
+                        using var hbbsTcp = new TcpClient();
+                        hbbsTcp.NoDelay = true;
+                        await hbbsTcp.ConnectAsync("127.0.0.1", internalHbbsPort, token);
+                        using var hbbsStream = hbbsTcp.GetStream();
 
-                        byte[] payload = new byte[packetLen];
-                        if (!await ReadExactAsync(stream, payload, packetLen, token)) break;
+                        await hbbsStream.WriteAsync(firstByte, 0, 1, token);
 
-                        await udp.SendAsync(payload, packetLen);
+                        var t1 = stream.CopyToAsync(hbbsStream, token);
+                        var t2 = hbbsStream.CopyToAsync(stream, token);
+                        await Task.WhenAny(t1, t2);
                     }
                 }
-                else
+            }
+            catch { }
+            finally
+            {
+                Interlocked.Decrement(ref _activeTcpTunnels);
+            }
+        }
+
+        private void InspectPacketForPeerId(byte[] payload, string ip, string mode)
+        {
+            try
+            {
+                string ascii = Encoding.ASCII.GetString(payload);
+                var match = Regex.Match(ascii, @"\b([1-9][0-9]{7,10})\b");
+                if (match.Success)
                 {
-                    // ถ้าไม่ใช่ 0xFE แปลว่าเป็นคำสั่ง TCP ปกติของ RustDesk (เช่น PunchHoleRequest / RequestRelay)
-                    using var hbbsTcp = new TcpClient();
-                    hbbsTcp.NoDelay = true;
-                    await hbbsTcp.ConnectAsync("127.0.0.1", internalHbbsPort, token);
-                    using var hbbsStream = hbbsTcp.GetStream();
+                    string peerId = match.Groups[1].Value;
+                    bool isNew = !_peers.ContainsKey(peerId);
 
-                    // ส่งไบต์แรกที่อ่านมาแล้วเข้าไปก่อน แล้วเชื่อมท่อถึงกัน
-                    await hbbsStream.WriteAsync(firstByte, 0, 1, token);
+                    _peers.AddOrUpdate(peerId,
+                        id => new PeerSessionInfo
+                        {
+                            PeerId = id,
+                            IpAddress = ip,
+                            Mode = mode,
+                            FirstSeen = DateTime.Now,
+                            LastSeen = DateTime.Now,
+                            BytesTransferred = payload.Length
+                        },
+                        (id, existing) =>
+                        {
+                            existing.IpAddress = ip;
+                            existing.Mode = mode;
+                            existing.LastSeen = DateTime.Now;
+                            existing.BytesTransferred += payload.Length;
+                            return existing;
+                        });
 
-                    var t1 = stream.CopyToAsync(hbbsStream, token);
-                    var t2 = hbbsStream.CopyToAsync(stream, token);
-                    await Task.WhenAny(t1, t2);
+                    if (isNew)
+                    {
+                        AddServerLog($"เครื่องลูกข่าย ID: {peerId} เชื่อมต่อออนไลน์เข้ามาจาก IP: {ip} ({mode})");
+                    }
                 }
             }
+            catch { }
         }
 
         private async Task<bool> ReadExactAsync(NetworkStream stream, byte[] buffer, int count, CancellationToken token)
@@ -673,9 +834,252 @@ namespace TH_DESK_Server
             return true;
         }
 
+        // ==================== 9. BUILT-IN WEB CONSOLE SERVER ====================
+        private void StartWebConsoleServer(int webPort, string ddns, int idIn, int idOut, int relayIn, int relayOut, string pubKey)
+        {
+            if (_bridgeCts == null) return;
+            var token = _bridgeCts.Token;
+
+            try
+            {
+                _webConsoleListener = new TcpListener(IPAddress.Any, webPort);
+                _webConsoleListener.Start();
+
+                Task.Run(async () =>
+                {
+                    while (!token.IsCancellationRequested)
+                    {
+                        try
+                        {
+                            var client = await _webConsoleListener.AcceptTcpClientAsync(token);
+                            _ = HandleWebHttpRequestAsync(client, ddns, idIn, idOut, relayIn, relayOut, pubKey, token);
+                        }
+                        catch { break; }
+                    }
+                }, token);
+            }
+            catch (Exception ex)
+            {
+                AddServerLog($"[คำเตือน] ไม่สามารถเปิดพอร์ต Web Console :{webPort} ได้ ({ex.Message})");
+            }
+        }
+
+        private async Task HandleWebHttpRequestAsync(TcpClient client, string ddns, int idIn, int idOut, int relayIn, int relayOut, string pubKey, CancellationToken token)
+        {
+            using (client)
+            {
+                try
+                {
+                    using var stream = client.GetStream();
+                    byte[] buf = new byte[4096];
+                    int read = await stream.ReadAsync(buf, 0, buf.Length, token);
+                    if (read <= 0) return;
+
+                    string req = Encoding.UTF8.GetString(buf, 0, read);
+                    string firstLine = req.Split('\r', '\n')[0];
+                    string path = "/";
+                    var parts = firstLine.Split(' ');
+                    if (parts.Length >= 2) path = parts[1];
+
+                    if (path.StartsWith("/api/status"))
+                    {
+                        TimeSpan up = _isRunning ? (DateTime.Now - _serverStartTime) : TimeSpan.Zero;
+                        var peerList = _peers.Values
+                            .OrderByDescending(p => p.IsOnline)
+                            .ThenByDescending(p => p.LastSeen)
+                            .Select(p => new
+                            {
+                                id = p.PeerId,
+                                ip = p.IpAddress,
+                                mode = p.Mode,
+                                online = p.IsOnline,
+                                lastSeen = p.LastSeen.ToString("HH:mm:ss"),
+                                ago = $"{(int)(DateTime.Now - p.LastSeen).TotalSeconds}s ago",
+                                traffic = FormatBytes(p.BytesTransferred)
+                            }).ToList();
+
+                        var payload = new
+                        {
+                            online = _isRunning,
+                            ddns = $"{ddns}:{idOut}",
+                            relay = $"{ddns}:{relayOut}",
+                            pubKey = pubKey,
+                            uptime = $"{(int)up.TotalHours:D2}:{up.Minutes:D2}:{up.Seconds:D2}",
+                            onlinePeers = _peers.Values.Count(p => p.IsOnline),
+                            totalPeers = _peers.Count,
+                            activeTunnels = Math.Max(0, _activeTcpTunnels),
+                            totalTraffic = FormatBytes(Interlocked.Read(ref _totalBytesRouted)),
+                            peers = peerList,
+                            logs = _eventLogs.Reverse().Take(30).ToList()
+                        };
+
+                        string json = JsonSerializer.Serialize(payload);
+                        await SendHttpResponseAsync(stream, "200 OK", "application/json; charset=utf-8", Encoding.UTF8.GetBytes(json));
+                    }
+                    else if (path.StartsWith("/download-bat"))
+                    {
+                        string bat = GenerateClientBatScript(ddns, idOut, relayOut, pubKey);
+                        byte[] data = Encoding.UTF8.GetBytes(bat);
+                        string header =
+                            "HTTP/1.1 200 OK\r\n" +
+                            "Content-Type: application/octet-stream\r\n" +
+                            "Content-Disposition: attachment; filename=\"Setup_TH_DESK_Client.bat\"\r\n" +
+                            $"Content-Length: {data.Length}\r\n" +
+                            "Connection: close\r\n\r\n";
+                        byte[] hBytes = Encoding.UTF8.GetBytes(header);
+                        await stream.WriteAsync(hBytes, 0, hBytes.Length, token);
+                        await stream.WriteAsync(data, 0, data.Length, token);
+                    }
+                    else
+                    {
+                        string html = GetWebDashboardHtml();
+                        await SendHttpResponseAsync(stream, "200 OK", "text/html; charset=utf-8", Encoding.UTF8.GetBytes(html));
+                    }
+                }
+                catch { }
+            }
+        }
+
+        private async Task SendHttpResponseAsync(NetworkStream stream, string status, string contentType, byte[] body)
+        {
+            string header =
+                $"HTTP/1.1 {status}\r\n" +
+                $"Content-Type: {contentType}\r\n" +
+                $"Content-Length: {body.Length}\r\n" +
+                "Cache-Control: no-cache\r\n" +
+                "Connection: close\r\n\r\n";
+            byte[] headerBytes = Encoding.UTF8.GetBytes(header);
+            await stream.WriteAsync(headerBytes, 0, headerBytes.Length);
+            await stream.WriteAsync(body, 0, body.Length);
+            await stream.FlushAsync();
+        }
+
+        private string GetWebDashboardHtml()
+        {
+            return @"<!DOCTYPE html>
+<html lang='th'>
+<head>
+<meta charset='utf-8'>
+<meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>TH_DESK Server Pro — Web Console</title>
+<style>
+  :root { --bg:#0B0E14; --card:#141926; --border:#222B3E; --blue:#0071FF; --cyan:#38BDF8; --green:#10B981; --text:#F8FAFC; --muted:#94A3B8; }
+  * { box-sizing:border-box; font-family:'Segoe UI',system-ui,sans-serif; }
+  body { margin:0; background:var(--bg); color:var(--text); padding:24px; }
+  .container { max-width:1100px; margin:0 auto; }
+  .header { display:flex; justify-content:space-between; align-items:center; background:var(--card); border:1px solid var(--border); padding:16px 22px; border-radius:14px; margin-bottom:20px; flex-wrap:wrap; gap:12px; }
+  .brand { display:flex; align-items:center; gap:12px; }
+  .logo { width:38px; height:38px; border-radius:10px; background:var(--blue); display:flex; align-items:center; justify-content:center; font-size:20px; font-weight:bold; }
+  .badge { background:#102A25; color:var(--green); border:1px solid var(--green); padding:6px 14px; border-radius:20px; font-size:13px; font-weight:bold; }
+  .grid-4 { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:14px; margin-bottom:20px; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:18px; }
+  .stat-label { color:var(--muted); font-size:13px; }
+  .stat-val { font-size:28px; font-weight:bold; margin-top:6px; }
+  .btn { background:var(--blue); color:#fff; border:none; padding:10px 18px; border-radius:8px; font-weight:600; cursor:pointer; text-decoration:none; display:inline-block; font-size:13.5px; }
+  .btn:hover { opacity:0.9; }
+  table { width:100%; border-collapse:collapse; margin-top:12px; }
+  th, td { text-align:left; padding:12px; border-bottom:1px solid var(--border); font-size:13.5px; }
+  th { color:var(--cyan); background:#10141F; }
+  .pill-on { color:var(--green); font-weight:bold; }
+  .pill-off { color:var(--muted); }
+  .log-box { background:#080A0F; border:1px solid var(--border); border-radius:10px; padding:14px; font-family:Consolas,monospace; font-size:12px; color:var(--muted); height:200px; overflow-y:auto; white-space:pre-wrap; }
+  .cfg-box { background:#0C0F17; border:1px solid var(--border); padding:12px; border-radius:8px; font-family:Consolas,monospace; font-size:13px; color:var(--cyan); word-break:break-all; margin:10px 0; }
+</style>
+</head>
+<body>
+<div class='container'>
+  <div class='header'>
+    <div class='brand'>
+      <div class='logo'>⚡</div>
+      <div>
+        <div style='font-size:18px;font-weight:bold;'>TH_DESK SERVER <span style='color:var(--cyan);font-size:13px;'>WEB CONSOLE</span></div>
+        <div style='color:var(--muted);font-size:12px;'>ระบบตรวจสอบสถานะเครื่องลูกข่ายและดาวน์โหลดไฟล์ตั้งค่าอัตโนมัติ (Real-time Dashboard)</div>
+      </div>
+    </div>
+    <div style='display:flex;gap:10px;align-items:center;'>
+      <a class='btn' href='/download-bat'>📥 ดาวน์โหลดตัวตั้งค่าลูกข่าย (.BAT)</a>
+      <span id='statusBadge' class='badge'>● Online</span>
+    </div>
+  </div>
+
+  <div class='grid-4'>
+    <div class='card'><div class='stat-label'>🟢 เครื่องที่ออนไลน์ (Online Peers)</div><div id='stOnline' class='stat-val' style='color:var(--green)'>0</div></div>
+    <div class='card'><div class='stat-label'>⚡ ท่อที่กำลังเชื่อมอยู่</div><div id='stTunnels' class='stat-val' style='color:var(--cyan)'>0</div></div>
+    <div class='card'><div class='stat-label'>📊 ปริมาณข้อมูลสะสม (Traffic)</div><div id='stTraffic' class='stat-val' style='color:#A78BFA'>0 KB</div></div>
+    <div class='card'><div class='stat-label'>⏱ เวลาเปิดเซิร์ฟเวอร์ (Uptime)</div><div id='stUptime' class='stat-val'>00:00:00</div></div>
+  </div>
+
+  <div class='card' style='margin-bottom:20px;'>
+    <div style='font-weight:bold;font-size:15px;color:var(--cyan);'>🔑 ข้อมูลสำหรับเชื่อมต่อเซิร์ฟเวอร์ (Server Endpoint & Public Key)</div>
+    <div id='cfgInfo' class='cfg-box'>Loading...</div>
+  </div>
+
+  <div class='card' style='margin-bottom:20px;'>
+    <div style='font-weight:bold;font-size:15px;'>📡 รายการเครื่องลูกข่ายที่เชื่อมต่อเข้ามา (Connected Client Peers)</div>
+    <table>
+      <thead><tr><th>สถานะ</th><th>หมายเลข ID (Peer ID)</th><th>IP Address</th><th>โหมดการเชื่อมต่อ</th><th>รับส่งข้อมูล</th><th>อัปเดตล่าสุด</th></tr></thead>
+      <tbody id='peerTable'><tr><td colspan='6' style='color:var(--muted);text-align:center;'>ยังไม่มีเครื่องเชื่อมต่อเข้ามา...</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class='card'>
+    <div style='font-weight:bold;font-size:15px;margin-bottom:10px;color:var(--cyan);'>📋 บันทึกเหตุการณ์เซิร์ฟเวอร์ล่าสุด (Live Event Logs)</div>
+    <div id='logBox' class='log-box'>Loading...</div>
+  </div>
+</div>
+
+<script>
+async function refreshData() {
+  try {
+    const r = await fetch('/api/status');
+    const d = await r.json();
+    document.getElementById('stOnline').innerText = d.onlinePeers + ' / ' + d.totalPeers;
+    document.getElementById('stTunnels').innerText = d.activeTunnels;
+    document.getElementById('stTraffic').innerText = d.totalTraffic;
+    document.getElementById('stUptime').innerText = d.uptime;
+    document.getElementById('cfgInfo').innerText = 'ID Server: ' + d.ddns + '   |   Relay Server: ' + d.relay + '\nPublic Key: ' + d.pubKey;
+
+    const tb = document.getElementById('peerTable');
+    if (!d.peers || d.peers.length === 0) {
+      tb.innerHTML = '<tr><td colspan=""6"" style=""color:#94A3B8;text-align:center;"">กำลังรอเครื่องลูกข่ายเชื่อมต่อเข้ามา...</td></tr>';
+    } else {
+      tb.innerHTML = d.peers.map(p => `<tr>
+        <td class='${p.online ? ""pill-on"" : ""pill-off""}'>${p.online ? ""🟢 Online"" : ""⚪ Offline""}</td>
+        <td style='font-weight:bold;color:#38BDF8;font-size:15px;'>${p.id}</td>
+        <td>${p.ip}</td>
+        <td>${p.mode}</td>
+        <td>${p.traffic}</td>
+        <td>${p.lastSeen} (${p.ago})</td>
+      </tr>`).join('');
+    }
+    document.getElementById('logBox').innerText = (d.logs || []).join('\n');
+  } catch (e) {}
+}
+refreshData();
+setInterval(refreshData, 1500);
+</script>
+</body>
+</html>";
+        }
+
+        private void BtnOpenWeb_Click(object sender, RoutedEventArgs e)
+        {
+            if (!int.TryParse(txtWebPort.Text.Trim(), out int webPort)) webPort = 8080;
+            if (!_isRunning)
+            {
+                MessageBox.Show(
+                    _currentLang == "TH"
+                        ? "กรุณากดปุ่ม '▶ เปิดระบบ Server' ก่อนเปิดหน้า Web Console ครับ"
+                        : "Please start the server first before opening the Web Console.",
+                    "TH_DESK Server", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+            OpenUrl($"http://localhost:{webPort}");
+        }
+
         private async void BtnCheckPort_Click(object sender, RoutedEventArgs e)
         {
-            if (!ValidatePorts(out int idIn, out int idOut, out int relayIn, out int relayOut))
+            if (!ValidatePorts(out int idIn, out int idOut, out int relayIn, out int relayOut, out int webPort))
                 return;
 
             bool isTH = (_currentLang == "TH");
@@ -703,9 +1107,10 @@ namespace TH_DESK_Server
             if (extIdTcpOk && extRelayTcpOk)
             {
                 lblStatus.Text = isTH
-                    ? $"ผ่านทั้งหมด! ท่อ TCP ทั้ง ID ({idOut}) และ Relay ({relayOut}) ทะลุเร้าเตอร์พร้อมใช้งาน 100%"
-                    : $"Success! Both ID ({idOut}) and Relay ({relayOut}) TCP ports are OPEN.";
+                    ? $"ผ่านทั้งหมด! พอร์ตทั้ง ID ({idOut}) และ Relay ({relayOut}) ทะลุเร้าเตอร์พร้อมใช้งาน 100%"
+                    : $"Success! Both ID ({idOut}) and Relay ({relayOut}) ports are OPEN.";
                 lblStatus.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#10B981"));
+                AddServerLog($"ทดสอบพอร์ตภายนอก {ddns}:{idOut} และ :{relayOut} -> ผ่าน 100%");
             }
             else
             {
@@ -714,6 +1119,7 @@ namespace TH_DESK_Server
                     : $"Local OK, External status: ID({idOut})={(extIdTcpOk ? "OPEN" : "CLOSED")}, Relay({relayOut})={(extRelayTcpOk ? "OPEN" : "CLOSED")}";
                 lblStatus.Text = failMsg;
                 lblStatus.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#F59E0B"));
+                AddServerLog(failMsg);
             }
         }
 
@@ -733,7 +1139,7 @@ namespace TH_DESK_Server
             });
         }
 
-        // ==================== 8. ปุ่มในหน้า Settings และ About ====================
+        // ==================== 10. ปุ่มในหน้า Settings และ About ====================
         private void BtnOpenFolder_Click(object sender, RoutedEventArgs e)
         {
             Process.Start("explorer.exe", AppDomain.CurrentDomain.BaseDirectory);
@@ -755,7 +1161,7 @@ namespace TH_DESK_Server
                 try { File.Delete(Path.Combine(baseDir, "id_ed25519.pub")); } catch { }
                 txtPubKey.Text = "-";
                 txtClientConfig.Text = "";
-                MessageBox.Show(isTH ? "ลบ Key เดิมเรียบร้อยแล้ว กดเปิด Server ที่หน้าหลักเพื่อสร้าง Key ใหม่ได้เลยครับ" : "Old KeyPair deleted. Start the server to generate a new one.");
+                AddServerLog("ลบไฟล์ Key เดิมแล้ว พร้อมสร้างใหม่เมื่อกดเปิด Server");
             }
         }
 
@@ -768,13 +1174,13 @@ namespace TH_DESK_Server
             try { Process.Start(new ProcessStartInfo(url) { UseShellExecute = true }); } catch { }
         }
 
-        // ==================== 9. บันทึกและโหลดค่า Config ====================
+        // ==================== 11. บันทึกและโหลดค่า Config ====================
         private void SaveConfig()
         {
             try
             {
                 string minTray = (chkMinimizeToTray.IsChecked == true) ? "1" : "0";
-                string data = $"{_currentLang}|{txtDdns.Text}|{txtIdIn.Text}|{txtIdOut.Text}|{txtRelayIn.Text}|{txtRelayOut.Text}|{minTray}";
+                string data = $"{_currentLang}|{txtDdns.Text}|{txtIdIn.Text}|{txtIdOut.Text}|{txtRelayIn.Text}|{txtRelayOut.Text}|{minTray}|{txtWebPort.Text}";
                 File.WriteAllText(_configPath, data);
             }
             catch { }
@@ -796,16 +1202,14 @@ namespace TH_DESK_Server
                         txtRelayIn.Text = parts[4];
                         txtRelayOut.Text = parts[5];
                     }
-                    if (parts.Length >= 7)
-                    {
-                        chkMinimizeToTray.IsChecked = (parts[6] == "1");
-                    }
+                    if (parts.Length >= 7) chkMinimizeToTray.IsChecked = (parts[6] == "1");
+                    if (parts.Length >= 8) txtWebPort.Text = parts[7];
                 }
             }
             catch { }
         }
 
-        // ==================== 10. Helper Functions & Window Events ====================
+        // ==================== 12. Helper Functions & Window Events ====================
         private void TitleBar_MouseDown(object sender, MouseButtonEventArgs e)
         {
             if (e.ChangedButton == MouseButton.Left) this.DragMove();
@@ -848,13 +1252,15 @@ namespace TH_DESK_Server
             }
         }
 
-        private bool ValidatePorts(out int idIn, out int idOut, out int relayIn, out int relayOut)
+        private bool ValidatePorts(out int idIn, out int idOut, out int relayIn, out int relayOut, out int webPort)
         {
             idIn = idOut = relayIn = relayOut = 0;
+            webPort = 8080;
             bool valid = int.TryParse(txtIdIn.Text, out idIn) && idIn >= 1 && idIn <= 65535 &&
                          int.TryParse(txtIdOut.Text, out idOut) && idOut >= 1 && idOut <= 65535 &&
                          int.TryParse(txtRelayIn.Text, out relayIn) && relayIn >= 1 && relayIn <= 65535 &&
-                         int.TryParse(txtRelayOut.Text, out relayOut) && relayOut >= 1 && relayOut <= 65535;
+                         int.TryParse(txtRelayOut.Text, out relayOut) && relayOut >= 1 && relayOut <= 65535 &&
+                         int.TryParse(txtWebPort.Text, out webPort) && webPort >= 1 && webPort <= 65535;
 
             if (!valid)
                 MessageBox.Show(_currentLang == "TH" ? "หมายเลขพอร์ตต้องอยู่ระหว่าง 1 ถึง 65535 เท่านั้น" : "Ports must be between 1 and 65535.", "TH_DESK", MessageBoxButton.OK, MessageBoxImage.Warning);
@@ -894,6 +1300,7 @@ namespace TH_DESK_Server
         {
             try { _bridgeCts?.Cancel(); } catch { }
             try { _tcpBridgeListener?.Stop(); } catch { }
+            try { _webConsoleListener?.Stop(); } catch { }
 
             try { if (_hbbsProc != null && !_hbbsProc.HasExited) _hbbsProc.Kill(); } catch { }
             try { if (_hbbrProc != null && !_hbbrProc.HasExited) _hbbrProc.Kill(); } catch { }
