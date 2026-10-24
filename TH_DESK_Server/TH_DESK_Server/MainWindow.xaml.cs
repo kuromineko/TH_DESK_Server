@@ -2,15 +2,16 @@
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Net.Sockets;
 using System.Reflection;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Input;
 using System.Windows.Media;
 
-// ป้องกันชื่อคลาสชนกันเมื่อเปิดใช้ UseWindowsForms ร่วมกับ WPF
 using WinForms = System.Windows.Forms;
 using Drawing = System.Drawing;
 using Application = System.Windows.Application;
@@ -26,6 +27,8 @@ namespace TH_DESK_Server
     {
         private Process? _hbbsProc;
         private Process? _hbbrProc;
+        private TcpListener? _tcpBridgeListener;
+        private CancellationTokenSource? _bridgeCts;
         private bool _isRunning = false;
         private string _currentLang = "TH";
         private readonly string _configPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "th_desk_server.cfg");
@@ -40,7 +43,6 @@ namespace TH_DESK_Server
             CheckAutoStartStatus();
             ApplyLanguage(_currentLang);
 
-            // กรณีเปิดเครื่อง Windows แล้วรันอัตโนมัติผ่านพารามิเตอร์ --autostart
             string[] args = Environment.GetCommandLineArgs();
             if (args.Any(a => a.Equals("--autostart", StringComparison.OrdinalIgnoreCase)))
             {
@@ -62,9 +64,7 @@ namespace TH_DESK_Server
                 Visible = true
             };
 
-            // ดับเบิลคลิกที่ไอคอนมุมขวาล่างเพื่อเปิดหน้าต่างกลับมา
             _trayIcon.DoubleClick += (s, e) => RestoreFromTray();
-
             UpdateTrayMenuText();
         }
 
@@ -84,14 +84,12 @@ namespace TH_DESK_Server
         {
             try
             {
-                // ดึงไอคอน .ico ที่ฝังอยู่ในตัวไฟล์ .exe มาใช้ทั้งใน System Tray และหน้าต่างหลัก
                 string? exePath = Process.GetCurrentProcess().MainModule?.FileName;
                 if (!string.IsNullOrEmpty(exePath))
                 {
                     var exeIcon = Drawing.Icon.ExtractAssociatedIcon(exePath);
                     if (exeIcon != null)
                     {
-                        // ตั้งค่าไอคอนบน Taskbar ให้ตรงกันด้วย
                         this.Icon = System.Windows.Interop.Imaging.CreateBitmapSourceFromHIcon(
                             exeIcon.Handle,
                             Int32Rect.Empty,
@@ -103,7 +101,6 @@ namespace TH_DESK_Server
             }
             catch { }
 
-            // สำรอง: ถ้ายังไม่ได้ใส่ไฟล์ .ico ให้วาดป้าย TH สีน้ำเงินเหมือนเดิม
             using var bmp = new Drawing.Bitmap(32, 32);
             using (var g = Drawing.Graphics.FromImage(bmp))
             {
@@ -141,7 +138,7 @@ namespace TH_DESK_Server
             this.Activate();
         }
 
-        // ==================== 2. ระบบเปิด Server อัตโนมัติเมื่อเปิดเครื่อง (Auto-Start on Boot) ====================
+        // ==================== 2. ระบบเปิด Server อัตโนมัติเมื่อเปิดเครื่อง ====================
         private void CheckAutoStartStatus()
         {
             try
@@ -170,7 +167,6 @@ namespace TH_DESK_Server
             if (enable)
             {
                 SaveConfig();
-                // ลงทะเบียนใน Task Scheduler ด้วยสิทธิ์สูงสุด (/RL HIGHEST) เพื่อให้เปิดผ่าน UAC ตอนบูตเครื่องได้ทันที
                 string args = $"/Create /TN \"{AutoStartTaskName}\" /TR \"\\\"{exePath}\\\" --autostart\" /SC ONLOGON /RL HIGHEST /F";
                 StartHiddenProcess("schtasks.exe", args)?.WaitForExit();
                 MessageBox.Show(
@@ -190,7 +186,7 @@ namespace TH_DESK_Server
             }
         }
 
-        // ==================== 3. ระบบส่งออกไฟล์ตั้งค่าให้เครื่องลูกข่าย (ไม่ต้องกรอก IP/Key เอง) ====================
+        // ==================== 3. ระบบส่งออกไฟล์ตั้งค่าให้เครื่องลูกข่าย ====================
         private void BtnExportClient_Click(object sender, RoutedEventArgs e)
         {
             if (!ValidatePorts(out _, out int idOut, out _, out int relayOut))
@@ -212,31 +208,32 @@ namespace TH_DESK_Server
             string exportDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Client_Config_Export");
             Directory.CreateDirectory(exportDir);
 
-            // 1. สร้างไฟล์ตั้งค่า .toml สำหรับ TH_DESK และ RustDesk
             string tomlContent =
                 $"rendezvous_server = '{ddns}:{idOut}'\r\n" +
-                $"nat_type = 1\r\n" +
+                $"nat_type = 2\r\n" +
                 $"serial = 0\r\n\r\n" +
                 $"[options]\r\n" +
                 $"custom-rendezvous-server = '{ddns}:{idOut}'\r\n" +
                 $"relay-server = '{ddns}:{relayOut}'\r\n" +
                 $"key = '{pubKey}'\r\n" +
-                $"direct-server = 'Y'\r\n";
+                $"direct-server = 'Y'\r\n" +
+                $"force-always-relay = 'Y'\r\n";
 
             File.WriteAllText(Path.Combine(exportDir, "TH_DESK2.toml"), tomlContent, new UTF8Encoding(false));
 
-            // 2. สร้างไฟล์สคริปต์ .bat คลิกเดียวสำหรับเครื่องลูกข่าย (นำค่าไปวางใน %AppData% อัตโนมัติ)
             string batContent =
                 "@echo off\r\n" +
                 "chcp 65001 >nul\r\n" +
                 "echo ======================================================\r\n" +
                 "echo   กำลังติดตั้งค่าเซิร์ฟเวอร์ TH_DESK อัตโนมัติ (ไม่ต้องกรอก IP/Key)\r\n" +
                 "echo ======================================================\r\n" +
+                "taskkill /F /IM TH_DESK.exe >nul 2>&1\r\n" +
+                "taskkill /F /IM rustdesk.exe >nul 2>&1\r\n" +
                 "if not exist \"%APPDATA%\\TH_DESK\\config\" mkdir \"%APPDATA%\\TH_DESK\\config\"\r\n" +
                 "if not exist \"%APPDATA%\\RustDesk\\config\" mkdir \"%APPDATA%\\RustDesk\\config\"\r\n" +
                 "(\r\n" +
                 $"echo rendezvous_server = '{ddns}:{idOut}'\r\n" +
-                "echo nat_type = 1\r\n" +
+                "echo nat_type = 2\r\n" +
                 "echo serial = 0\r\n" +
                 "echo.\r\n" +
                 "echo [options]\r\n" +
@@ -244,6 +241,7 @@ namespace TH_DESK_Server
                 $"echo relay-server = '{ddns}:{relayOut}'\r\n" +
                 $"echo key = '{pubKey}'\r\n" +
                 "echo direct-server = 'Y'\r\n" +
+                "echo force-always-relay = 'Y'\r\n" +
                 ") > \"%APPDATA%\\TH_DESK\\config\\TH_DESK2.toml\"\r\n" +
                 "copy /Y \"%APPDATA%\\TH_DESK\\config\\TH_DESK2.toml\" \"%APPDATA%\\RustDesk\\config\\RustDesk2.toml\" >nul\r\n" +
                 "echo.\r\n" +
@@ -360,15 +358,13 @@ namespace TH_DESK_Server
 
             UpdateTrayMenuText();
 
-            // เมนูซ้าย
             navDashboard.Content = isTH ? "🖥  หน้าหลัก Server" : "🖥  Dashboard";
             navSettings.Content = isTH ? "⚙  ตั้งค่าระบบ" : "⚙  Settings";
             navAbout.Content = isTH ? "ℹ  เกี่ยวกับโปรแกรม" : "ℹ  About & Credits";
 
-            // หน้า Dashboard
             lblDdnsTitle.Text = isTH ? "1. โดเมน DDNS หรือ Public IP ของคุณ" : "1. Your DDNS Domain or Public IP";
             lblDdnsSub.Text = isTH ? "ที่อยู่สำหรับให้เครื่องปลายทางเชื่อมต่อเข้ามาจากภายนอก" : "External host address for client connections";
-            lblIdServerTitle.Text = "2. ID Server (hbbs)";
+            lblIdServerTitle.Text = "2. ID Server (hbbs + TCP Bridge)";
             lblIdInPort.Text = isTH ? "IN Port (ในเครื่อง):" : "IN Port (Local PC):";
             lblIdOutPort.Text = isTH ? "Out Port (พอร์ตนอก):" : "Out Port (External):";
             lblRelayServerTitle.Text = "3. Relay Server (hbbr)";
@@ -379,8 +375,8 @@ namespace TH_DESK_Server
             {
                 btnToggle.Content = isTH ? "▶  เปิดระบบ Server + เปิด Firewall" : "▶  Start Server & Open Firewall";
                 lblStatus.Text = isTH
-                    ? "พร้อมทำงาน — กดปุ่มเปิดระบบเพื่อคลายไฟล์และเริ่มการทำงานของ Server ได้ทันที"
-                    : "Ready — Click Start Server to extract embedded binaries and launch";
+                    ? "พร้อมทำงาน — รองรับโหมด TCP Bridge ทะลุ THDDNS / CGNAT อัตโนมัติ"
+                    : "Ready — Supports TCP Bridge mode for THDDNS / CGNAT";
             }
             else
             {
@@ -393,7 +389,6 @@ namespace TH_DESK_Server
             btnCopy.Content = isTH ? "📋 คัดลอกค่า" : "📋 Copy Text";
             btnExportClient.Content = isTH ? "📥 ส่งออกไฟล์ลูกข่าย" : "📥 Export Client File";
 
-            // หน้า Settings
             lblSettingsHeader.Text = isTH ? "ตั้งค่าระบบ (System Settings)" : "System Settings";
             lblSettingsSub.Text = isTH ? "กำหนดภาษา พฤติกรรมการเปิดพอร์ต และการจัดการไฟล์ระบบของ TH_DESK Server" : "Configure interface language, startup behavior, and server key management";
             lblLangSettingTitle.Text = isTH ? "ภาษาที่แสดงผล (Display Language)" : "Display Language";
@@ -407,7 +402,6 @@ namespace TH_DESK_Server
             btnOpenFolder.Content = isTH ? "📂 เปิดโฟลเดอร์เก็บไฟล์ Server" : "📂 Open Server Folder";
             btnResetKey.Content = isTH ? "🔑 ลบและสร้าง Public Key ใหม่" : "🔑 Regenerate KeyPair";
 
-            // หน้า About
             lblAboutHeader.Text = isTH ? "เกี่ยวกับ TH_DESK (About & Open Source Credits)" : "About TH_DESK & Open Source Credits";
             lblAboutDesc.Text = isTH ? "โปรแกรมรีโมทเดสก์ท็อปและตัวจัดการเซิร์ฟเวอร์แบบโอเพนซอร์ส แจกจ่ายฟรีสำหรับทุกคน" : "Free & Open-Source P2P Remote Desktop and Self-Hosted Server Manager";
             lblCreatorTitle.Text = isTH ? "ผู้พัฒนาและดูแลโปรเจกต์ (Developer & Maintainer)" : "Developer & Project Maintainer";
@@ -422,7 +416,7 @@ namespace TH_DESK_Server
             btnOpenLicense.Content = isTH ? "📜 อ่านสัญญาอนุญาต AGPL-3.0" : "📜 View AGPL-3.0 License";
         }
 
-        // ==================== 7. ระบบควบคุม Server (Start / Stop / Port Check) ====================
+        // ==================== 7. ระบบควบคุม Server & TCP-to-UDP Bridge ====================
         private async void BtnToggle_Click(object sender, RoutedEventArgs e)
         {
             bool isTH = (_currentLang == "TH");
@@ -472,7 +466,10 @@ namespace TH_DESK_Server
             string ddns = txtDdns.Text.Trim();
             bool openFw = (chkAutoFirewall.IsChecked == true);
 
-            lblStatus.Text = isTH ? "กำลังเคลียร์โปรเซสเก่าและเริ่มระบบ Server ตามพอร์ตที่ตั้งไว้..." : "Starting Server processes...";
+            // คำนวณพอร์ตภายในสำหรับ hbbs.exe เพื่อไม่ให้ชนกับพอร์ต TCP Bridge หน้าบ้าน
+            int internalHbbsPort = (idIn < 50000) ? (idIn + 10000) : (idIn - 10000);
+
+            lblStatus.Text = isTH ? "กำลังเริ่มระบบ Server พร้อมสะพานแปลงสัญญาณ TCP-to-UDP Bridge..." : "Starting Server with TCP-to-UDP Bridge...";
             lblStatus.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#38BDF8"));
 
             await Task.Run(() =>
@@ -481,6 +478,10 @@ namespace TH_DESK_Server
 
                 if (openFw)
                 {
+                    AllowProgramInFirewall("TH_DESK_SERVER_MANAGER", Process.GetCurrentProcess().MainModule?.FileName ?? "");
+                    AllowProgramInFirewall("TH_DESK_HBBS_APP", hbbsPath);
+                    AllowProgramInFirewall("TH_DESK_HBBR_APP", hbbrPath);
+
                     for (int p = idIn - 1; p <= idIn + 2; p++)
                     {
                         if (p >= 1 && p <= 65535)
@@ -492,8 +493,14 @@ namespace TH_DESK_Server
                     OpenFirewall($"TH_DESK_RELAY_TCP_{relayIn}", relayIn, "TCP");
                 }
 
+                // 1. รัน hbbr.exe (Relay Server) ที่พอร์ต relayIn ตามปกติ (เพราะเป็น TCP อยู่แล้ว)
                 _hbbrProc = StartHiddenProcess(hbbrPath, $"-p {relayIn}");
-                _hbbsProc = StartHiddenProcess(hbbsPath, $"-p {idIn} -r {ddns}:{relayOut}");
+
+                // 2. รัน hbbs.exe ที่พอร์ตหลังบ้าน (internalHbbsPort)
+                _hbbsProc = StartHiddenProcess(hbbsPath, $"-p {internalHbbsPort} -r {ddns}:{relayOut}");
+
+                // 3. เปิดสะพาน TCP-to-UDP Bridge ที่พอร์ตหน้าบ้าน (idIn)
+                StartTcpBridge(idIn, internalHbbsPort);
             });
 
             string pubKeyFile = Path.Combine(baseDir, "id_ed25519.pub");
@@ -521,44 +528,192 @@ namespace TH_DESK_Server
             txtHeaderStatus.Text = "Online";
             txtHeaderStatus.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#10B981"));
             lblStatus.Text = isTH
-                ? $"ทำงานอยู่ — เปิดพอร์ตในเครื่อง (IN) {idIn}/{relayIn} ➔ ออกสู่พอร์ตนอก (OUT) {ddns}:{idOut}/{relayOut}"
-                : $"Online — Local (IN) {idIn}/{relayIn} ➔ External (OUT) {ddns}:{idOut}/{relayOut}";
+                ? $"ทำงานอยู่ (TCP Bridge Mode) — รับพอร์ต {idIn}/{relayIn} ➔ ออกสู่ {ddns}:{idOut}/{relayOut}"
+                : $"Online (TCP Bridge Mode) — Local {idIn}/{relayIn} ➔ External {ddns}:{idOut}/{relayOut}";
             lblStatus.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#10B981"));
+        }
+
+        // ==================== สะพานแปลงสัญญาณ TCP <-> UDP (หัวใจหลักทะลุ THDDNS) ====================
+        private void StartTcpBridge(int publicPort, int internalHbbsPort)
+        {
+            _bridgeCts = new CancellationTokenSource();
+            var token = _bridgeCts.Token;
+
+            // เปิดรับทั้ง TCP (สำหรับทะลุ THDDNS) และ UDP (สำหรับเครื่องที่ต่อ UDP ปกติ)
+            _tcpBridgeListener = new TcpListener(IPAddress.Any, publicPort);
+            _tcpBridgeListener.Start();
+
+            // Task 1: รับสาย TCP จากภายนอก แล้วแยกแยะว่าเป็นคำสั่ง UDP-over-TCP (0xFE) หรือ TCP ปกติ
+            Task.Run(async () =>
+            {
+                while (!token.IsCancellationRequested)
+                {
+                    try
+                    {
+                        var client = await _tcpBridgeListener.AcceptTcpClientAsync(token);
+                        _ = HandleBridgeClientAsync(client, internalHbbsPort, token);
+                    }
+                    catch { break; }
+                }
+            }, token);
+
+            // Task 2: ส่งต่อ UDP หน้าบ้าน (เผื่อใช้งานในวง LAN หรือลูกข่ายเดิม) ไปยัง internalHbbsPort
+            Task.Run(async () =>
+            {
+                using var udpListener = new UdpClient(publicPort);
+                var clientMap = new System.Collections.Concurrent.ConcurrentDictionary<IPEndPoint, UdpClient>();
+                while (!token.IsCancellationRequested)
+                {
+                    try
+                    {
+                        var received = await udpListener.ReceiveAsync(token);
+                        var senderEp = received.RemoteEndPoint;
+
+                        var relayUdp = clientMap.GetOrAdd(senderEp, ep =>
+                        {
+                            var u = new UdpClient();
+                            u.Connect("127.0.0.1", internalHbbsPort);
+                            Task.Run(async () =>
+                            {
+                                try
+                                {
+                                    while (!token.IsCancellationRequested)
+                                    {
+                                        var resp = await u.ReceiveAsync(token);
+                                        await udpListener.SendAsync(resp.Buffer, resp.Buffer.Length, ep);
+                                    }
+                                }
+                                catch { }
+                            }, token);
+                            return u;
+                        });
+
+                        await relayUdp.SendAsync(received.Buffer, received.Buffer.Length);
+                    }
+                    catch { if (token.IsCancellationRequested) break; }
+                }
+            }, token);
+        }
+
+        private async Task HandleBridgeClientAsync(TcpClient client, int internalHbbsPort, CancellationToken token)
+        {
+            using (client)
+            {
+                client.NoDelay = true;
+                using var stream = client.GetStream();
+
+                byte[] firstByte = new byte[1];
+                int r = await stream.ReadAsync(firstByte, 0, 1, token);
+                if (r == 0) return;
+
+                // ถ้ารหัสไบต์แรกเป็น 0xFE แปลว่าเป็นโหมด "UDP-over-TCP Tunnel" จากลูกข่าย TH_DESK!
+                if (firstByte[0] == 0xFE)
+                {
+                    using var udp = new UdpClient();
+                    udp.Connect("127.0.0.1", internalHbbsPort);
+
+                    // ขาอ่านจาก UDP (hbbs) -> ส่งกลับเข้าท่อ TCP (ลูกข่าย)
+                    var udpToTcp = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            while (!token.IsCancellationRequested)
+                            {
+                                var res = await udp.ReceiveAsync(token);
+                                byte[] lenBuf = BitConverter.GetBytes((ushort)res.Buffer.Length);
+                                await stream.WriteAsync(lenBuf, 0, 2, token);
+                                await stream.WriteAsync(res.Buffer, 0, res.Buffer.Length, token);
+                                await stream.FlushAsync(token);
+                            }
+                        }
+                        catch { }
+                    }, token);
+
+                    // ขาอ่านจากท่อ TCP (ลูกข่าย) -> ยิงเข้า UDP (hbbs)
+                    byte[] lenBytes = new byte[2];
+                    while (!token.IsCancellationRequested)
+                    {
+                        if (!await ReadExactAsync(stream, lenBytes, 2, token)) break;
+                        int packetLen = BitConverter.ToUInt16(lenBytes, 0);
+                        if (packetLen <= 0 || packetLen > 65500) break;
+
+                        byte[] payload = new byte[packetLen];
+                        if (!await ReadExactAsync(stream, payload, packetLen, token)) break;
+
+                        await udp.SendAsync(payload, packetLen);
+                    }
+                }
+                else
+                {
+                    // ถ้าไม่ใช่ 0xFE แปลว่าเป็นคำสั่ง TCP ปกติของ RustDesk (เช่น PunchHoleRequest / RequestRelay)
+                    using var hbbsTcp = new TcpClient();
+                    hbbsTcp.NoDelay = true;
+                    await hbbsTcp.ConnectAsync("127.0.0.1", internalHbbsPort, token);
+                    using var hbbsStream = hbbsTcp.GetStream();
+
+                    // ส่งไบต์แรกที่อ่านมาแล้วเข้าไปก่อน แล้วเชื่อมท่อถึงกัน
+                    await hbbsStream.WriteAsync(firstByte, 0, 1, token);
+
+                    var t1 = stream.CopyToAsync(hbbsStream, token);
+                    var t2 = hbbsStream.CopyToAsync(stream, token);
+                    await Task.WhenAny(t1, t2);
+                }
+            }
+        }
+
+        private async Task<bool> ReadExactAsync(NetworkStream stream, byte[] buffer, int count, CancellationToken token)
+        {
+            int offset = 0;
+            while (offset < count)
+            {
+                int read = await stream.ReadAsync(buffer, offset, count - offset, token);
+                if (read == 0) return false;
+                offset += read;
+            }
+            return true;
         }
 
         private async void BtnCheckPort_Click(object sender, RoutedEventArgs e)
         {
-            if (!ValidatePorts(out int idIn, out int idOut, out _, out _))
+            if (!ValidatePorts(out int idIn, out int idOut, out int relayIn, out int relayOut))
                 return;
 
             bool isTH = (_currentLang == "TH");
             string ddns = txtDdns.Text.Trim();
-            lblStatus.Text = isTH ? $"กำลังตรวจสอบพอร์ตในเครื่อง ({idIn}) และพอร์ตนอก ({ddns}:{idOut})..." : $"Checking local ({idIn}) and external ({ddns}:{idOut})...";
+            lblStatus.Text = isTH
+                ? $"กำลังตรวจสอบพอร์ต ID ({idOut}) และ Relay ({relayOut}) บน {ddns}..."
+                : $"Checking ID ({idOut}) and Relay ({relayOut}) on {ddns}...";
             lblStatus.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#F59E0B"));
 
-            bool localOk = await TestTcpPortAsync("127.0.0.1", idIn, 1500);
-            bool extOk = await TestTcpPortAsync(ddns, idOut, 3000);
+            bool localIdOk = await TestTcpPortAsync("127.0.0.1", idIn, 1200);
+            bool localRelayOk = await TestTcpPortAsync("127.0.0.1", relayIn, 1200);
 
-            if (localOk && extOk)
+            bool extIdTcpOk = await TestTcpPortAsync(ddns, idOut, 2500);
+            bool extRelayTcpOk = await TestTcpPortAsync(ddns, relayOut, 2500);
+
+            if (!localIdOk || !localRelayOk)
             {
                 lblStatus.Text = isTH
-                    ? $"ผ่านทั้งหมด! พอร์ตในเครื่อง ({idIn}) ทำงานอยู่ และพอร์ตนอก ({ddns}:{idOut}) ทะลุเร้าเตอร์สำเร็จ"
-                    : $"Success! Local port {idIn} and External {ddns}:{idOut} are both OPEN.";
-                lblStatus.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#10B981"));
+                    ? $"พอร์ตในเครื่อง ({idIn}/{relayIn}) ยังไม่ทำงาน! กรุณากดปุ่ม 'เปิดระบบ Server' ก่อนครับ"
+                    : $"Local ports ({idIn}/{relayIn}) are not listening. Please start the server first.";
+                lblStatus.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#EF4444"));
+                return;
             }
-            else if (localOk && !extOk)
+
+            if (extIdTcpOk && extRelayTcpOk)
             {
                 lblStatus.Text = isTH
-                    ? $"พอร์ตในเครื่อง ({idIn}) เปิดตรงแล้ว! แต่พอร์ตนอก ({ddns}:{idOut}) ยังไม่ทะลุเร้าเตอร์"
-                    : $"Local port {idIn} is OPEN, but external {ddns}:{idOut} is not reachable yet.";
-                lblStatus.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#38BDF8"));
+                    ? $"ผ่านทั้งหมด! ท่อ TCP ทั้ง ID ({idOut}) และ Relay ({relayOut}) ทะลุเร้าเตอร์พร้อมใช้งาน 100%"
+                    : $"Success! Both ID ({idOut}) and Relay ({relayOut}) TCP ports are OPEN.";
+                lblStatus.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#10B981"));
             }
             else
             {
-                lblStatus.Text = isTH
-                    ? $"พอร์ตในเครื่อง ({idIn}) ยังไม่เปิด (กรุณากดปุ่ม 'เปิดระบบ Server' ก่อนครับ)"
-                    : $"Local port {idIn} is not listening. Please start the server first.";
-                lblStatus.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#EF4444"));
+                string failMsg = isTH
+                    ? $"พอร์ตในเครื่องทำงานแล้ว แต่พอร์ตนอกยังติด: ID({idOut})={(extIdTcpOk ? "ผ่าน" : "ไม่ผ่าน")}, Relay({relayOut})={(extRelayTcpOk ? "ผ่าน" : "ไม่ผ่าน")}"
+                    : $"Local OK, External status: ID({idOut})={(extIdTcpOk ? "OPEN" : "CLOSED")}, Relay({relayOut})={(extRelayTcpOk ? "OPEN" : "CLOSED")}";
+                lblStatus.Text = failMsg;
+                lblStatus.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#F59E0B"));
             }
         }
 
@@ -707,6 +862,14 @@ namespace TH_DESK_Server
             return valid;
         }
 
+        private void AllowProgramInFirewall(string ruleName, string exePath)
+        {
+            if (string.IsNullOrEmpty(exePath)) return;
+            string cmd = $"/C netsh advfirewall firewall delete rule name=\"{ruleName}\" >nul 2>&1 & " +
+                         $"netsh advfirewall firewall add rule name=\"{ruleName}\" dir=in action=allow program=\"{exePath}\" enable=yes >nul 2>&1";
+            StartHiddenProcess("cmd.exe", cmd)?.WaitForExit();
+        }
+
         private void OpenFirewall(string ruleName, int port, string proto)
         {
             string cmd = $"/C netsh advfirewall firewall delete rule name=\"{ruleName}\" >nul 2>&1 & " +
@@ -729,6 +892,9 @@ namespace TH_DESK_Server
 
         private void StopServerProcesses()
         {
+            try { _bridgeCts?.Cancel(); } catch { }
+            try { _tcpBridgeListener?.Stop(); } catch { }
+
             try { if (_hbbsProc != null && !_hbbsProc.HasExited) _hbbsProc.Kill(); } catch { }
             try { if (_hbbrProc != null && !_hbbrProc.HasExited) _hbbrProc.Kill(); } catch { }
 
