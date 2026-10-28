@@ -148,7 +148,7 @@
                         </Border>
 
                         <StackPanel VerticalAlignment="Bottom" Margin="18,0,14,16">
-                            <TextBlock Text="TH_DESK Enterprise Server" FontSize="11.5" FontWeight="SemiBold" Foreground="#64748B"/>
+                            <TextBlock Text="TH_DESK Server" FontSize="11.5" FontWeight="SemiBold" Foreground="#64748B"/>
                             <TextBlock Text="AGPL-3.0 Open Source" FontSize="10.5" Foreground="#475569"/>
                         </StackPanel>
                     </Grid>
